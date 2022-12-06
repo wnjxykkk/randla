@@ -13,6 +13,8 @@ from pathlib import Path
 from dataset import ms_map, dataloader
 from utils.tools import DataProcessing as DP
 from utils.tools import ConfigS3DIS as cfg
+from mindspore.nn.loss.loss import LossBase
+
 class SharedMLP(nn.Cell):
     def __init__(
         self,
@@ -294,7 +296,7 @@ class RandLANet(nn.Cell):
         feature = self.bn_start(feature)  # shape (B, 8, N, 1)
 
         #
-        print(labels)
+        # print(labels)
         onehot = nn.OneHot(depth=13)
         # print(labels, labels.shape, type(labels))
         multihot_labels = [P.cast(onehot(labels), ms.int32)]
@@ -332,6 +334,7 @@ class RandLANet(nn.Cell):
         self_enhance_loss = None
         num_loss = 0
         f_decoder_list = []
+        se_features_list = []
         for j in range(5):
             f_interp_i = self.random_sample(feature, interp_idx[-j - 1])  # [B, d, n, 1]
             # f_interp_i = self.nearest_interpolation(feature, interp_idx[-j - 1])
@@ -339,9 +342,11 @@ class RandLANet(nn.Cell):
             f_decoder_i = self.decoder[j](cat((f_stack[-j - 2], f_interp_i)))
             feature = f_decoder_i
             f_decoder_list.append(f_decoder_i)
+
             if j < 4:
                 #se
                 se_features = self.Se[j](f_decoder_i)
+                se_features_list.append(se_features)
                 target_se_features = P.cast(P.GreaterEqual()(se_features, 0.), ms.int32)
                 if self_enhance_loss is None:
                     self_enhance_loss = P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(target_se_features.astype(ms.float32), se_features.astype(ms.float32)))
@@ -358,13 +363,13 @@ class RandLANet(nn.Cell):
 
         scores = self.fc_end(f_decoder_list[-1])  # [B, num_classes, N, 1]
         self_enhance_loss /= num_loss
-        h_loss = P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[5], supervised_features[0]))
-        h_loss += P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[4], supervised_features[1]))
-        h_loss += P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[3], supervised_features[2]))
-        h_loss += P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[2], supervised_features[3]))
-        h_loss /= 4.
-        return scores.squeeze(-1), h_loss, self_enhance_loss
-
+        # h_loss = P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[5], supervised_features[0]))
+        # h_loss += P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[4], supervised_features[1]))
+        # h_loss += P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[3], supervised_features[2]))
+        # h_loss += P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[2], supervised_features[3]))
+        # h_loss /= 4.
+        # return scores.squeeze(-1), h_loss, self_enhance_loss
+        return scores.squeeze(-1), multihot_labels, supervised_features, se_features_list
     @staticmethod
     def random_sample(feature, pool_idx):
         """
@@ -417,13 +422,75 @@ class RandLANet(nn.Cell):
         interpolated_features = P.expand_dims(interpolated_features, axis=2)
         return interpolated_features
 
+class WeightCEloss(LossBase):
+    """weight ce loss"""
+    def __init__(self, weights, num_classes):
+        super(WeightCEloss, self).__init__()
+        self.weights = weights
+        self.num_classes = num_classes
+        self.onehot = nn.OneHot(depth=num_classes)
+        self.loss_fn = nn.SoftmaxCrossEntropyWithLogits(sparse=False)
+
+    def construct(self, logits, labels):
+        logit = logits.swapaxes(-2, -1).reshape((-1, self.num_classes))  # [b*n, 13]
+        labels = labels.reshape((-1,))  # [b, n] --> [b*n]
+        one_hot_labels = self.onehot(labels)  # [b*n, 13]
+        # self.weights = weights.expand_dims(0) # [13,] --> [1, 13]
+        weights = self.weights * one_hot_labels  # [b*n, 13]
+        weights = P.ReduceSum()(weights, 1)  # [b*n]
+        unweighted_loss = self.loss_fn(logit, one_hot_labels)  # [b*n]
+        weighted_loss = unweighted_loss * weights  # [b*n]
+        CE_loss = weighted_loss.mean()  # [1]
+
+        return CE_loss
+
+class Hloss(LossBase):
+    """h_loss"""
+
+    def __init__(self):
+        super(Hloss, self).__init__()
+        self.loss_fn = P.SigmoidCrossEntropyWithLogits()
+    def construct(self, multihot_labels, supervised_features):
+        h_loss = P.reduce_mean(self.loss_fn(multihot_labels[5], supervised_features[0]))
+        h_loss += P.reduce_mean(self.loss_fn(multihot_labels[4], supervised_features[1]))
+        h_loss += P.reduce_mean(self.loss_fn(multihot_labels[3], supervised_features[2]))
+        h_loss += P.reduce_mean(self.loss_fn(multihot_labels[2], supervised_features[3]))
+        h_loss /= 4.
+        return h_loss
+
+class SEloss(LossBase):
+    """se_loss"""
+
+    def __init__(self):
+        super(SEloss, self).__init__()
+        self.loss_fn = P.SigmoidCrossEntropyWithLogits()
+
+    def construct(self, se_features_list):
+        self_enhance_loss = None
+        for i in range(4):
+            se_features = se_features_list[i]
+            target_se_features = P.cast(P.GreaterEqual()(se_features, 0.), ms.int32)
+            if self_enhance_loss is None:
+                self_enhance_loss = P.reduce_mean(
+                    self.loss_fn(target_se_features.astype(ms.float32),
+                                                      se_features.astype(ms.float32)))
+            else:
+                self_enhance_loss += P.reduce_mean(
+                    self.loss_fn(target_se_features.astype(ms.float32),
+                                                      se_features.astype(ms.float32)))
+        self_enhance_loss /= 4.
+        return self_enhance_loss
+
 class RandLAWithLoss(nn.Cell):
     """RadnLA-net with loss"""
     def __init__(self, network, weights, num_classes):
         super(RandLAWithLoss, self).__init__()
-        self.se_loss = Parameter(Tensor(0.0, ms.float32), name='se_loss', requires_grad=True)
-        self.CE_loss = Parameter(Tensor(0.0, ms.float32), name='CE_loss', requires_grad=True)
-        self.h_loss = Parameter(Tensor(0.0, ms.float32), name='h_loss', requires_grad=True)
+        self.ce_loss = WeightCEloss(weights, num_classes)
+        self.h_loss = Hloss()
+        self.se_loss = SEloss()
+        # self.se_loss = Parameter(Tensor(0.0, ms.float32), name='se_loss', requires_grad=True)
+        # self.CE_loss = Parameter(Tensor(0.0, ms.float32), name='CE_loss', requires_grad=True)
+        # self.h_loss = Parameter(Tensor(0.0, ms.float32), name='h_loss', requires_grad=True)
         self.network = network
         self.weights = weights
         self.num_classes = num_classes
@@ -436,23 +503,13 @@ class RandLAWithLoss(nn.Cell):
         neighbor_idx = [n0, n1, n2, n3, n4]
         sub_idx = [pl0, pl1, pl2, pl3, pl4]
         interp_idx = [u0, u1, u2, u3, u4]
-        logits, h_loss, se_loss = self.network(xyz, feature, neighbor_idx, sub_idx, interp_idx, labels)
-        logit = logits.swapaxes(-2, -1).reshape((-1, self.num_classes))  # [b*n, 13]
-        labels = labels.reshape((-1,))  # [b, n] --> [b*n]
-        one_hot_labels = self.onehot(labels)  # [b*n, 13]
-        # self.weights = weights.expand_dims(0) # [13,] --> [1, 13]
-        weights = self.weights * one_hot_labels  # [b*n, 13]
-        weights = P.ReduceSum()(weights, 1)  # [b*n]
-        unweighted_loss = self.loss_fn(logit, one_hot_labels)  # [b*n]
-        weighted_loss = unweighted_loss * weights  # [b*n]
-        CE_loss = weighted_loss.mean()  # [1]
-
-        # return CE_loss, logits
+        logits, multihot_labels, supervised_features, se_features_list = self.network(xyz, feature, neighbor_idx, sub_idx, interp_idx, labels)
+        CE_loss = self.ce_loss(logits, labels)
+        h_loss = self.h_loss(multihot_labels, supervised_features)
+        se_loss = self.se_loss(se_features_list)
+        loss = CE_loss + h_loss + se_loss
         print(CE_loss, h_loss, se_loss)
-        self.CE_loss = CE_loss
-        self.h_loss = h_loss
-        self.se_loss = se_loss
-        return CE_loss + h_loss + se_loss
+        return loss
 
 class TrainingWrapper(nn.Cell):
     """Training wrapper."""
@@ -518,7 +575,7 @@ if __name__ == '__main__':
 
     dir = Path('/home/ubuntu/hdd2/lkl/dataset/s3dis/input_0.040')
     print('generating data loader....')
-    train_ds, val_ds, dataset = dataloader(dir, val_area='Area_5', num_parallel_workers=8, shuffle=False)
+    train_ds, val_ds, dataset = dataloader(dir, val_area='Area_5', num_parallel_workers=1, shuffle=False)
     train_loader = train_ds.batch(batch_size=1,
                                   per_batch_map=ms_map,
                                   input_columns=["xyz", "colors", "labels", "q_idx", "c_idx"],
@@ -527,7 +584,7 @@ if __name__ == '__main__':
                                                   "n0", "n1", "n2", "n3", "n4",
                                                   "pl0", "pl1", "pl2", "pl3", "pl4",
                                                   "u0", "u1", "u2", "u3", "u4"],
-                                  num_parallel_workers=8,
+                                  num_parallel_workers=1,
                                   drop_remainder=True)
     train_loader = train_loader.create_dict_iterator()
     for i, data in enumerate(train_loader):
