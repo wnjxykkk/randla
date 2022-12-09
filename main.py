@@ -311,9 +311,9 @@ class RandLANet(nn.Cell):
             feature = f_sampled_i
             #label sample
             # print(i, multihot_labels[i])
-            tmp_multihot_label = P.reduce_max(self.gather_neighbour(multihot_labels[i], neighbor_idx[i]), 2)
+            tmp_multihot_label = P.ReduceMax()(self.gather_neighbour(multihot_labels[i], neighbor_idx[i]), 2)
             # print(1, tmp_multihot_label.shape)
-            tmp_multihot_label = P.reduce_max(self.gather_neighbour(tmp_multihot_label, neighbor_idx[i]), 2)
+            tmp_multihot_label = P.ReduceMax()(self.gather_neighbour(tmp_multihot_label, neighbor_idx[i]), 2)
 
             # print(2, tmp_multihot_label.shape)
             tmp_multihot_label = tmp_multihot_label.expand_dims(2)
@@ -369,6 +369,7 @@ class RandLANet(nn.Cell):
         # h_loss += P.reduce_mean(P.SigmoidCrossEntropyWithLogits()(multihot_labels[2], supervised_features[3]))
         # h_loss /= 4.
         # return scores.squeeze(-1), h_loss, self_enhance_loss
+
         return scores.squeeze(-1), multihot_labels, supervised_features, se_features_list
     @staticmethod
     def random_sample(feature, pool_idx):
@@ -451,10 +452,11 @@ class Hloss(LossBase):
         super(Hloss, self).__init__()
         self.loss_fn = P.SigmoidCrossEntropyWithLogits()
     def construct(self, multihot_labels, supervised_features):
-        h_loss = P.reduce_mean(self.loss_fn(multihot_labels[5], supervised_features[0]))
-        h_loss += P.reduce_mean(self.loss_fn(multihot_labels[4], supervised_features[1]))
-        h_loss += P.reduce_mean(self.loss_fn(multihot_labels[3], supervised_features[2]))
-        h_loss += P.reduce_mean(self.loss_fn(multihot_labels[2], supervised_features[3]))
+
+        h_loss = P.ReduceMean()(self.loss_fn(multihot_labels[5], supervised_features[0]))
+        h_loss += P.ReduceMean()(self.loss_fn(multihot_labels[4], supervised_features[1]))
+        h_loss += P.ReduceMean()(self.loss_fn(multihot_labels[3], supervised_features[2]))
+        h_loss += P.ReduceMean()(self.loss_fn(multihot_labels[2], supervised_features[3]))
         h_loss /= 4.
         return h_loss
 
@@ -471,15 +473,18 @@ class SEloss(LossBase):
             se_features = se_features_list[i]
             target_se_features = P.cast(P.GreaterEqual()(se_features, 0.), ms.int32)
             if self_enhance_loss is None:
-                self_enhance_loss = P.reduce_mean(
+                self_enhance_loss = P.ReduceMean()(
                     self.loss_fn(target_se_features.astype(ms.float32),
                                                       se_features.astype(ms.float32)))
             else:
-                self_enhance_loss += P.reduce_mean(
+                self_enhance_loss += P.ReduceMean()(
                     self.loss_fn(target_se_features.astype(ms.float32),
                                                       se_features.astype(ms.float32)))
         self_enhance_loss /= 4.
         return self_enhance_loss
+
+import mindspore.numpy as msnp
+from utils.metrics import accuracy, intersection_over_union
 
 class RandLAWithLoss(nn.Cell):
     """RadnLA-net with loss"""
@@ -494,8 +499,6 @@ class RandLAWithLoss(nn.Cell):
         self.network = network
         self.weights = weights
         self.num_classes = num_classes
-        self.onehot = nn.OneHot(depth=num_classes)
-        self.loss_fn = nn.SoftmaxCrossEntropyWithLogits(sparse=False)
 
     def construct(self, feature, labels, input_inds, cloud_inds, p0, p1, p2, p3, p4, n0, n1, n2, n3, n4, pl0, pl1, pl2,
                   pl3, pl4, u0, u1, u2, u3, u4):
@@ -575,7 +578,7 @@ if __name__ == '__main__':
 
     dir = Path('/home/ubuntu/hdd2/lkl/dataset/s3dis/input_0.040')
     print('generating data loader....')
-    train_ds, val_ds, dataset = dataloader(dir, val_area='Area_5', num_parallel_workers=1, shuffle=False)
+    train_ds, val_ds, dataset = dataloader(dir, val_area='Area_5', num_parallel_workers=8, shuffle=False)
     train_loader = train_ds.batch(batch_size=1,
                                   per_batch_map=ms_map,
                                   input_columns=["xyz", "colors", "labels", "q_idx", "c_idx"],
@@ -584,7 +587,7 @@ if __name__ == '__main__':
                                                   "n0", "n1", "n2", "n3", "n4",
                                                   "pl0", "pl1", "pl2", "pl3", "pl4",
                                                   "u0", "u1", "u2", "u3", "u4"],
-                                  num_parallel_workers=1,
+                                  num_parallel_workers=8,
                                   drop_remainder=True)
     train_loader = train_loader.create_dict_iterator()
     for i, data in enumerate(train_loader):
